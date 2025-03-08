@@ -1,0 +1,6 @@
+{
+    "enable_sl_tp_sync": true,    // Sincronizar cambios de SL/TP
+    "allow_no_sl_tp": true,       // Permitir copiar sin SL/TP
+    "max_price_deviation": 2.0,   // Máxima desviación de precio
+    "execution_timeout": 3.0      // Tiempo máximo de ejecución
+}
