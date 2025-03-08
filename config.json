@@ -1,6 +1,49 @@
 {
-    "enable_sl_tp_sync": true,    // Sincronizar cambios de SL/TP
-    "allow_no_sl_tp": true,       // Permitir copiar sin SL/TP
-    "max_price_deviation": 2.0,   // Máxima desviación de precio
-    "execution_timeout": 3.0      // Tiempo máximo de ejecución
+    "copy_pairs": [
+        {
+            "source": {
+                "login": 123456,
+                "password": "Fuente1Pass",
+                "server": "Broker1Server"
+            },
+            "target": {
+                "login": 789012,
+                "password": "Destino1Pass",
+                "server": "Broker2Server"
+            },
+            "settings": {
+                "volume_multiplier": 1.5,
+                "sync_interval": 0.3,
+                "max_deviation_pips": 3,
+                "risk_management": {
+                    "max_drawdown": 5.0,
+                    "daily_stop": 10.0
+                }
+            }
+        },
+        {
+            "source": {
+                "login": 654321,
+                "password": "Fuente2Pass",
+                "server": "Broker3Server"
+            },
+            "target": {
+                "login": 210987,
+                "password": "Destino2Pass",
+                "server": "Broker4Server"
+            },
+            "settings": {
+                "volume_multiplier": 0.8,
+                "sync_interval": 0.5,
+                "max_deviation_pips": 5,
+                "symbol_filter": ["EURUSD", "XAUUSD"]
+            }
+        }
+    ],
+    "global_settings": {
+        "max_threads": 8,
+        "connection_timeout": 5.0,
+        "max_retries": 5,
+        "log_level": "DEBUG"
+    }
 }
