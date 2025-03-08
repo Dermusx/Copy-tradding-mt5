@@ -1,277 +1,302 @@
 import MetaTrader5 as mt5
-import time
-import os
 import json
+import os
+import time
+import threading
 from datetime import datetime
-from typing import Dict, Tuple
+from queue import Queue
+from typing import Dict, List, Optional
+import psutil
 
-# Configuración inicial
-os.system('cls')
-os.system('title CopyTrading ULTIMATE')
-VERSION = "3.1"
-COPY_MAGIC = 9999
-MAX_RETRIES = 5
-POLL_INTERVAL = 0.1
-SYNC_INTERVAL = 5.0
-
-class CopyTradingConfig:
-    def __init__(self):
-        self.config_file = "config.json"
-        self.default_config = {
-            "source_account": {
-                "login": 0,
-                "password": "password",
-                "server": "server"
-            },
-            "target_account": {
-                "login": 0,
-                "password": "password",
-                "server": "server"
-            },
-            "settings": {
-                "volume_multiplier": 1.0,
-                "enable_sl_tp_sync": True,
-                "allow_no_sl_tp": True,
-                "max_price_deviation": 2.0,
-                "execution_timeout": 3.0
-            }
-        }
-        
-        self.load_config()
+class MT5ConnectionPool:
+    _instance = None
+    _connections = {}
+    _lock = threading.Lock()
     
-    def load_config(self):
-        if not os.path.exists(self.config_file):
-            self.create_default_config()
-        
-        with open(self.config_file, 'r') as f:
-            config = json.load(f)
-            
-        self.source_account = config["source_account"]
-        self.target_account = config["target_account"]
-        self.settings = config["settings"]
-        
-        # Validación de config
-        self.settings["volume_multiplier"] = max(0.01, float(self.settings["volume_multiplier"]))
-        self.settings["max_price_deviation"] = max(0.1, float(self.settings["max_price_deviation"]))
-        self.settings["execution_timeout"] = max(0.5, float(self.settings["execution_timeout"]))
-        
-    def create_default_config(self):
-        with open(self.config_file, 'w') as f:
-            json.dump(self.default_config, f, indent=4)
-        raise Exception("Archivo config.json creado. Configure las cuentas!")
-
-class MT5ConnectionManager:
-    _active_connections = {}
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
     
-    def __init__(self, account):
-        self.account = account
-        self.login = account["login"]
-    
-    def __enter__(self):
-        if self.login in MT5ConnectionManager._active_connections:
-            return self
+    @classmethod
+    def get_connection(cls, account: Dict) -> bool:
+        with cls._lock:
+            key = f"{account['login']}@{account['server']}"
+            if key in cls._connections:
+                if time.time() - cls._connections[key]['last_used'] < 300:
+                    return True
+                else:
+                    mt5.shutdown()
             
-        if not mt5.initialize():
-            raise ConnectionError(f"Error inicializando MT5: {mt5.last_error()}")
-            
-        authorized = mt5.login(
-            self.account["login"],
-            self.account["password"],
-            self.account["server"]
-        )
-        
-        if not authorized:
-            mt5.shutdown()
-            raise ConnectionError(f"Login fallido: {mt5.last_error()}")
-            
-        MT5ConnectionManager._active_connections[self.login] = True
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.login in MT5ConnectionManager._active_connections:
-            mt5.shutdown()
-            del MT5ConnectionManager._active_connections[self.login]
-
-class TradeCopier:
-    def __init__(self, config: CopyTradingConfig):
-        self.config = config
-        self.copied_positions: Dict[int, Tuple[int, float, float]] = {}
-        self.last_sync = time.time()
-        self.logger = self.setup_logger()
-        
-    def setup_logger(self):
-        class AdvancedLogger:
-            def __init__(self):
-                self.log_file = "copytrading.log"
-            
-            def log(self, message: str, level: str = "INFO"):
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                log_entry = f"[{timestamp}] [{level}] {message}"
-                print(log_entry)
-                with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(log_entry + "\n")
-        
-        return AdvancedLogger()
-    
-    def execute_with_retry(self, func, *args, **kwargs):
-        for attempt in range(MAX_RETRIES):
             try:
-                return func(*args, **kwargs)
+                if not mt5.initialize():
+                    raise ConnectionError(f"Initialize failed: {mt5.last_error()}")
+                
+                authorized = mt5.login(
+                    account['login'],
+                    account['password'],
+                    account['server']
+                )
+                
+                if authorized:
+                    cls._connections[key] = {
+                        'handle': mt5,
+                        'last_used': time.time()
+                    }
+                    return True
+                return False
             except Exception as e:
-                self.logger.log(f"Intento {attempt+1} fallido: {str(e)}", "WARNING")
-                time.sleep(0.5)
-        raise Exception(f"Fallo después de {MAX_RETRIES} intentos")
+                print(f"Connection error: {str(e)}")
+                return False
     
-    def copy_position(self, source_position) -> int:
-        symbol = source_position.symbol
-        volume = round(source_position.volume * self.config.settings["volume_multiplier"], 2)
-        position_type = source_position.type
-        price = self.get_current_price(symbol, position_type)
+    @classmethod
+    def release_unused(cls):
+        with cls._lock:
+            current_time = time.time()
+            to_delete = []
+            for key, conn in cls._connections.items():
+                if current_time - conn['last_used'] > 300:
+                    mt5.shutdown()
+                    to_delete.append(key)
+            for key in to_delete:
+                del cls._connections[key]
+
+class AdvancedLogger:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.log_queue = Queue()
+            cls._instance.running = True
+            cls._instance.worker = threading.Thread(target=cls._instance._write_logs)
+            cls._instance.worker.daemon = True
+            cls._instance.worker.start()
+        return cls._instance
+    
+    def log(self, message: str, level: str = "INFO", pair_id: str = "GLOBAL"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        log_entry = f"[{timestamp}] [{level}] [{pair_id}] {message}"
+        self.log_queue.put(log_entry)
+    
+    def _write_logs(self):
+        with open("multicopy.log", "a", encoding="utf-8") as f:
+            while self.running or not self.log_queue.empty():
+                try:
+                    entry = self.log_queue.get(timeout=1)
+                    print(entry)
+                    f.write(entry + "\n")
+                    self.log_queue.task_done()
+                except:
+                    pass
+    
+    def shutdown(self):
+        self.running = False
+        self.worker.join()
+
+class CopyPairManager(threading.Thread):
+    def __init__(self, pair_config: Dict, pair_id: str):
+        super().__init__(daemon=True)
+        self.pair_config = pair_config
+        self.pair_id = pair_id
+        self.logger = AdvancedLogger()
+        self.running = True
+        self.copied_positions: Dict[int, int] = {}
+        self.last_sync = time.time()
+        self.position_lock = threading.Lock()
         
-        request = {
+    def run(self):
+        self.logger.log(f"Iniciando manager para par {self.pair_id}", "INFO", self.pair_id)
+        while self.running:
+            try:
+                self._sync_positions()
+                time.sleep(self.pair_config['settings'].get('sync_interval', 0.3))
+                MT5ConnectionPool.release_unused()
+            except Exception as e:
+                self.logger.log(f"Error crítico: {str(e)}", "CRITICAL", self.pair_id)
+                time.sleep(5)
+    
+    def _sync_positions(self):
+        # Obtener posiciones fuente
+        source_positions = self._get_positions(self.pair_config['source'])
+        if source_positions is None:
+            return
+        
+        # Obtener posiciones destino
+        target_positions = self._get_positions(self.pair_config['target'])
+        
+        with self.position_lock:
+            self._process_new_positions(source_positions, target_positions)
+            self._process_closed_positions(source_positions)
+            self._process_modifications(source_positions, target_positions)
+    
+    def _get_positions(self, account: Dict) -> Optional[List[mt5.TradePosition]]:
+        if not MT5ConnectionPool.get_connection(account):
+            self.logger.log(f"Conexión fallida a {account['login']}", "ERROR", self.pair_id)
+            return None
+        
+        try:
+            positions = mt5.positions_get()
+            return {pos.ticket: pos for pos in positions} if positions else {}
+        except Exception as e:
+            self.logger.log(f"Error obteniendo posiciones: {str(e)}", "ERROR", self.pair_id)
+            return None
+    
+    def _process_new_positions(self, source: Dict, target: Dict):
+        new_positions = set(source.keys()) - set(self.copied_positions.keys())
+        for ticket in new_positions:
+            self._copy_position(source[ticket], target)
+    
+    def _copy_position(self, position: mt5.TradePosition, target_positions: Dict):
+        # Validaciones
+        if not self._validate_position(position):
+            return
+        
+        # Preparar orden
+        request = self._prepare_order_request(position)
+        
+        # Enviar orden
+        if MT5ConnectionPool.get_connection(self.pair_config['target']):
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                new_ticket = self._get_target_ticket(result, target_positions)
+                if new_ticket:
+                    with self.position_lock:
+                        self.copied_positions[position.ticket] = new_ticket
+                    self.logger.log(f"Posición copiada {position.ticket}->{new_ticket}", "SUCCESS", self.pair_id)
+            else:
+                self.logger.log(f"Error copiando posición: {result.comment}", "ERROR", self.pair_id)
+    
+    def _prepare_order_request(self, position: mt5.TradePosition) -> Dict:
+        symbol_info = mt5.symbol_info(position.symbol)
+        multiplier = self.pair_config['settings'].get('volume_multiplier', 1.0)
+        price = mt5.symbol_info_tick(position.symbol).ask if position.type == mt5.POSITION_TYPE_BUY else mt5.symbol_info_tick(position.symbol).bid
+        
+        return {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": volume,
-            "type": mt5.ORDER_TYPE_BUY if position_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_SELL,
+            "symbol": position.symbol,
+            "volume": round(position.volume * multiplier, 2),
+            "type": mt5.ORDER_TYPE_BUY if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_SELL,
             "price": price,
-            "sl": source_position.sl,
-            "tp": source_position.tp,
-            "deviation": int(self.config.settings["max_price_deviation"]),
-            "magic": COPY_MAGIC,
-            "comment": "COPYTRADE",
+            "sl": position.sl,
+            "tp": position.tp,
+            "deviation": self.pair_config['settings'].get('max_deviation_pips', 5),
+            "magic": int(time.time()),
+            "comment": f"COPY_{self.pair_id}",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_FOK
         }
-        
-        with MT5ConnectionManager(self.config.target_account):
-            result = mt5.order_send(request)
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                raise Exception(f"Error copiando operación: {result.comment}")
-            
-            # Verificar posición creada
-            position = self.wait_for_position(symbol)
-            return position.ticket
     
-    def modify_position(self, target_ticket: int, new_sl: float, new_tp: float):
-        with MT5ConnectionManager(self.config.target_account):
-            position = mt5.positions_get(ticket=target_ticket)
-            if not position:
-                raise Exception("Posición no encontrada")
+    def _validate_position(self, position: mt5.TradePosition) -> bool:
+        # Filtros y validaciones
+        symbol_filter = self.pair_config['settings'].get('symbol_filter', [])
+        if symbol_filter and position.symbol not in symbol_filter:
+            return False
+        
+        if position.volume <= 0:
+            return False
             
-            position = position[0]
+        return True
+    
+    def _process_closed_positions(self, source_positions: Dict):
+        closed = set(self.copied_positions.keys()) - set(source_positions.keys())
+        for ticket in closed:
+            self._close_position(ticket)
+    
+    def _close_position(self, source_ticket: int):
+        target_ticket = self.copied_positions.get(source_ticket)
+        if target_ticket and MT5ConnectionPool.get_connection(self.pair_config['target']):
+            position = mt5.positions_get(ticket=target_ticket)
+            if position:
+                close_request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "position": target_ticket,
+                    "symbol": position[0].symbol,
+                    "volume": position[0].volume,
+                    "type": mt5.ORDER_TYPE_SELL if position[0].type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                    "price": mt5.symbol_info_tick(position[0].symbol).bid if position[0].type == mt5.POSITION_TYPE_BUY else mt5.symbol_info_tick(position[0].symbol).ask,
+                    "deviation": self.pair_config['settings'].get('max_deviation_pips', 5),
+                    "comment": f"CLOSE_{self.pair_id}"
+                }
+                result = mt5.order_send(close_request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    with self.position_lock:
+                        del self.copied_positions[source_ticket]
+                    self.logger.log(f"Posición cerrada {target_ticket}", "SUCCESS", self.pair_id)
+    
+    def _process_modifications(self, source: Dict, target: Dict):
+        for src_ticket, tgt_ticket in self.copied_positions.items():
+            src_pos = source.get(src_ticket)
+            tgt_pos = target.get(tgt_ticket)
+            
+            if src_pos and tgt_pos:
+                if src_pos.sl != tgt_pos.sl or src_pos.tp != tgt_pos.tp:
+                    self._modify_position(tgt_ticket, src_pos.sl, src_pos.tp)
+    
+    def _modify_position(self, ticket: int, sl: float, tp: float):
+        if MT5ConnectionPool.get_connection(self.pair_config['target']):
             request = {
                 "action": mt5.TRADE_ACTION_SLTP,
-                "position": target_ticket,
-                "symbol": position.symbol,
-                "sl": new_sl,
-                "tp": new_tp
+                "position": ticket,
+                "sl": sl,
+                "tp": tp
             }
-            
             result = mt5.order_send(request)
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                raise Exception(f"Error modificando SL/TP: {result.comment}")
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.logger.log(f"Modificado SL/TP {ticket}", "INFO", self.pair_id)
     
-    def get_current_price(self, symbol: str, position_type: int) -> float:
-        tick = mt5.symbol_info_tick(symbol)
-        return tick.ask if position_type == mt5.POSITION_TYPE_BUY else tick.bid
-    
-    def wait_for_position(self, symbol: str):
-        start_time = time.time()
-        while (time.time() - start_time) < self.config.settings["execution_timeout"]:
-            positions = mt5.positions_get(symbol=symbol, magic=COPY_MAGIC)
-            if positions:
-                return positions[0]
-            time.sleep(0.1)
-        raise Exception("Tiempo de espera agotado para posición")
-    
-    def sync_positions(self):
-        try:
-            with MT5ConnectionManager(self.config.source_account):
-                source_positions = {p.ticket: p for p in mt5.positions_get()}
-            
-            # Sincronizar nuevas posiciones
-            new_positions = set(source_positions.keys()) - set(self.copied_positions.keys())
-            for ticket in new_positions:
-                position = source_positions[ticket]
-                if self.config.settings["allow_no_sl_tp"] or (position.sl != 0 or position.tp != 0):
-                    try:
-                        copied_ticket = self.execute_with_retry(self.copy_position, position)
-                        self.copied_positions[ticket] = (copied_ticket, position.sl, position.tp)
-                        self.logger.log(f"Posición copiada: {ticket} -> {copied_ticket}")
-                    except Exception as e:
-                        self.logger.log(f"Error copiando posición {ticket}: {str(e)}", "ERROR")
-            
-            # Sincronizar cierres
-            closed_positions = set(self.copied_positions.keys()) - set(source_positions.keys())
-            for ticket in closed_positions:
-                target_ticket = self.copied_positions[ticket][0]
-                try:
-                    self.execute_with_retry(self.close_position, target_ticket)
-                    del self.copied_positions[ticket]
-                    self.logger.log(f"Posición cerrada: {target_ticket}")
-                except Exception as e:
-                    self.logger.log(f"Error cerrando posición {target_ticket}: {str(e)}", "ERROR")
-            
-            # Sincronizar modificaciones SL/TP
-            if self.config.settings["enable_sl_tp_sync"]:
-                for src_ticket, (tgt_ticket, prev_sl, prev_tp) in self.copied_positions.items():
-                    current_position = source_positions.get(src_ticket)
-                    if current_position and (current_position.sl != prev_sl or current_position.tp != prev_tp):
-                        try:
-                            self.execute_with_retry(self.modify_position, tgt_ticket, current_position.sl, current_position.tp)
-                            self.copied_positions[src_ticket] = (tgt_ticket, current_position.sl, current_position.tp)
-                            self.logger.log(f"SL/TP actualizado: {tgt_ticket} ({prev_sl}/{prev_tp} -> {current_position.sl}/{current_position.tp})")
-                        except Exception as e:
-                            self.logger.log(f"Error actualizando SL/TP {tgt_ticket}: {str(e)}", "ERROR")
-            
-            self.last_sync = time.time()
-            
-        except Exception as e:
-            self.logger.log(f"Error en sincronización: {str(e)}", "CRITICAL")
-    
-    def close_position(self, target_ticket: int):
-        with MT5ConnectionManager(self.config.target_account):
-            position = mt5.positions_get(ticket=target_ticket)
-            if not position:
-                return
-                
-            position = position[0]
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": position.symbol,
-                "volume": position.volume,
-                "type": mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
-                "position": target_ticket,
-                "price": self.get_current_price(position.symbol, position.type),
-                "deviation": int(self.config.settings["max_price_deviation"]),
-                "comment": "CT_CLOSE",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_FOK
-            }
-            
-            result = mt5.order_send(request)
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                raise Exception(f"Error cerrando posición: {result.comment}")
+    def _get_target_ticket(self, result, target_positions: Dict) -> Optional[int]:
+        time.sleep(0.2)
+        new_positions = mt5.positions_get()
+        if new_positions:
+            for pos in new_positions:
+                if pos.ticket not in target_positions:
+                    return pos.ticket
+        return None
+
+class ResourceMonitor(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.logger = AdvancedLogger()
+        self.running = True
     
     def run(self):
-        self.logger.log(f"Iniciando CopyTrading ULTIMATE v{VERSION}")
-        while True:
-            try:
-                self.sync_positions()
-                sleep_time = SYNC_INTERVAL - (time.time() - self.last_sync)
-                time.sleep(max(0.1, sleep_time))
-            except KeyboardInterrupt:
-                self.logger.log("Deteniendo sistema...")
-                break
-            except Exception as e:
-                self.logger.log(f"Error crítico: {str(e)}", "CRITICAL")
-                time.sleep(5)
+        while self.running:
+            cpu = psutil.cpu_percent()
+            mem = psutil.virtual_memory().percent
+            self.logger.log(f"Monitor: CPU={cpu}% MEM={mem}%", "DEBUG", "MONITOR")
+            time.sleep(60)
+
+class MultiCopyManager:
+    def __init__(self, config_file: str = "config.json"):
+        self.config = self._load_config(config_file)
+        self.logger = AdvancedLogger()
+        self.pair_managers = []
+        self.resource_monitor = ResourceMonitor()
+        
+    def _load_config(self, file_path: str) -> Dict:
+        with open(file_path, 'r') as f:
+            config = json.load(f)
+        return config
+    
+    def start(self):
+        self.resource_monitor.start()
+        
+        for idx, pair in enumerate(self.config['copy_pairs']):
+            manager = CopyPairManager(pair, f"PAIR_{idx+1}")
+            manager.start()
+            self.pair_managers.append(manager)
+            time.sleep(0.5)
+        
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.logger.log("Deteniendo todos los procesos...", "INFO", "GLOBAL")
+            for manager in self.pair_managers:
+                manager.running = False
+            self.resource_monitor.running = False
 
 if __name__ == "__main__":
-    try:
-        config = CopyTradingConfig()
-        copier = TradeCopier(config)
-        copier.run()
-    except Exception as e:
-        print(f"Error inicial: {str(e)}")
-        time.sleep(30)
+    manager = MultiCopyManager()
+    manager.start()
